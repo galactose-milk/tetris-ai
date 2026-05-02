@@ -375,6 +375,8 @@ class TetrisGame:
         self.lines      = 0
         self.paused     = False
         self.game_over  = False
+        self.result     = None   # "won" | "lost"
+        self.win_lines_target = 40
 
         # Timing
         self.fall_delay   = 0.5    # seconds between auto‑drops
@@ -393,6 +395,12 @@ class TetrisGame:
         self.ai_history    = []       # last N evaluations for graph
         self.ai_rot_attempts = 0      # track rotation attempts to prevent stuck
         self._plan_ai_move()
+
+    def _end_game(self, result):
+        self.game_over = True
+        self.result = result
+        self.paused = False
+        self.ai_thinking = False
 
     # ── Helpers ──────────────────────────────────────────────────────────────
     def _plan_ai_move(self):
@@ -423,6 +431,11 @@ class TetrisGame:
         self.score += [0, 100, 300, 500, 800][cleared] * self.level
         self.level = self.lines // 10 + 1
         self.fall_delay = max(0.05, 0.5 - (self.level - 1) * 0.04)
+
+        if self.lines >= self.win_lines_target:
+            self._end_game("won")
+            return
+
         self.piece = self.next_piece
         self.next_piece = Piece()
         self.last_fall = time.time()
@@ -432,7 +445,7 @@ class TetrisGame:
         # even above the visible board, it's game over
         for (x, y) in self.piece.cells:
             if y >= 0 and self.board.grid[y][x] is not None:
-                self.game_over = True
+                self._end_game("lost")
                 return
 
         if self.ai_mode:
@@ -639,7 +652,11 @@ class Renderer:
         if game.paused:
             self._overlay("PAUSED", "(Press P to Resume)")
         if game.game_over:
-            self._overlay("GAME OVER", f"Score: {game.score}  Press ESC")
+            if game.result == "won":
+                title = "U WON"
+            else:
+                title = "U LOST"
+            self._overlay(title, "Press ENTER to return to the start screen")
 
         pygame.display.flip()
 
@@ -965,9 +982,16 @@ def main():
                     renderer = Renderer(screen)
                     state    = "game"
             elif state == "game":
-                if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                if game and game.game_over and event.type == pygame.KEYDOWN and event.key in (pygame.K_RETURN, pygame.K_SPACE, pygame.K_ESCAPE):
                     state = "menu"
                     menu  = MenuScreen(screen)
+                    game  = None
+                    renderer = None
+                elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                    state = "menu"
+                    menu  = MenuScreen(screen)
+                    game  = None
+                    renderer = None
                 else:
                     game.handle_event(event)
 
@@ -983,6 +1007,8 @@ def main():
 
         clock.tick(FPS)
 
-
+  
 if __name__ == "__main__":
-    main()
+    main() 
+
+    
