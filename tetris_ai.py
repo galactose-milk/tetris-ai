@@ -95,12 +95,16 @@ SHAPES = {
 PIECE_NAMES = list(SHAPES.keys())
 
 # ─────────────────────── HEURISTIC WEIGHTS ────────────────────────────────────
-# Tuned classic weights for the Tetris heuristic AI
+# GA-optimized weights from Yiyuan Lee's research + additional robustness features
+# These were computed via genetic algorithm on the unit 3-sphere and extended
+# with max_height and well_depth penalties for practical robustness.
 WEIGHTS = {
-    'lines_cleared':     1.0,     # reward
-    'aggregate_height': -0.510066,
-    'holes':            -0.35663,
-    'bumpiness':        -0.184483,
+    'complete_lines':    0.760666,   # reward clearing lines
+    'aggregate_height': -0.510066,   # penalize tall stacks
+    'holes':            -0.35663,    # penalize buried gaps
+    'bumpiness':        -0.184483,   # penalize uneven surfaces
+    'max_height':       -0.30,       # penalize tallest column spikes
+    'well_depth':       -0.15,       # penalize deep wells
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -150,6 +154,10 @@ class Board:
     def aggregate_height(self):
         return sum(self.column_heights())
 
+    def max_height(self):
+        """Height of the tallest column — penalizes dangerous spike-ups."""
+        return max(self.column_heights())
+
     def count_holes(self):
         holes = 0
         for x in range(BOARD_W):
@@ -165,17 +173,47 @@ class Board:
         heights = self.column_heights()
         return sum(abs(heights[i] - heights[i+1]) for i in range(len(heights)-1))
 
+    def well_depth(self):
+        """Sum of well depths. A well exists where a column is lower than both
+        its neighbors. Edge columns only need one neighbor to be higher."""
+        heights = self.column_heights()
+        total = 0
+        for i in range(BOARD_W):
+            if i == 0:
+                # left edge — compare to right neighbor only
+                well = max(0, heights[1] - heights[0])
+            elif i == BOARD_W - 1:
+                # right edge — compare to left neighbor only
+                well = max(0, heights[BOARD_W - 2] - heights[BOARD_W - 1])
+            else:
+                # interior column — must be lower than both neighbors
+                left_diff = heights[i - 1] - heights[i]
+                right_diff = heights[i + 1] - heights[i]
+                if left_diff > 0 and right_diff > 0:
+                    well = min(left_diff, right_diff)
+                else:
+                    well = 0
+            total += well
+        return total
+
     def evaluate(self):
+        """Evaluate board state with 6-feature heuristic.
+        Returns (score, lines, agg_h, holes, bump, max_h, wells)."""
         temp_board = self.copy()
-        lines = temp_board.clear_lines()
-        h     = temp_board.aggregate_height()
-        holes = temp_board.count_holes()
-        bump  = temp_board.bumpiness()
-        score = (WEIGHTS['lines_cleared']     * lines +
-                 WEIGHTS['aggregate_height']  * h     +
-                 WEIGHTS['holes']             * holes  +
-                 WEIGHTS['bumpiness']         * bump)
-        return score, lines, h, holes, bump
+        lines  = temp_board.clear_lines()
+        agg_h  = temp_board.aggregate_height()
+        holes  = temp_board.count_holes()
+        bump   = temp_board.bumpiness()
+        max_h  = temp_board.max_height()
+        wells  = temp_board.well_depth()
+
+        score = (WEIGHTS['complete_lines']    * lines +
+                 WEIGHTS['aggregate_height']  * agg_h +
+                 WEIGHTS['holes']             * holes +
+                 WEIGHTS['bumpiness']         * bump  +
+                 WEIGHTS['max_height']        * max_h +
+                 WEIGHTS['well_depth']        * wells)
+        return score, lines, agg_h, holes, bump, max_h, wells
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -209,58 +247,116 @@ class Piece:
 #  AI SOLVER
 # ══════════════════════════════════════════════════════════════════════════════
 class AISolver:
-    def find_best_move(self, board: Board, piece: Piece):
-        """Try all rotations × columns, return (rotation, x, heuristic_info)."""
+    @staticmethod
+    def _hard_drop_piece(board, piece_name, rot, col):
+        """Simulate dropping a piece from the top. Returns (cells, valid)."""
+        sy = -2
+        last_valid_y = sy
+        valid_start = False
+        while True:
+            cells = [(col + dx, sy + 1 + dy)
+                     for (dx, dy) in SHAPES[piece_name][rot]]
+            if board.is_valid(cells):
+                sy += 1
+                last_valid_y = sy
+                valid_start = True
+            else:
+                break
+
+        final_cells = [(col + dx, last_valid_y + dy)
+                       for (dx, dy) in SHAPES[piece_name][rot]]
+
+        # Must be a valid resting position with all cells on the board
+        if not valid_start:
+            return final_cells, False
+        if not board.is_valid(final_cells):
+            return final_cells, False
+        if not all(0 <= x < BOARD_W for x, y in final_cells):
+            return final_cells, False
+        if not any(0 <= y < BOARD_H for x, y in final_cells):
+            return final_cells, False
+
+        return final_cells, True
+
+    def _score_placement(self, board, piece_name, piece_color, rot, col):
+        """Score a single placement. Returns (score, info) or None if invalid."""
+        cells, valid = self._hard_drop_piece(board, piece_name, rot, col)
+        if not valid:
+            return None
+
+        sim_board = board.copy()
+        sim_board.lock(cells, piece_color)
+        score, lines, h, holes, bump, max_h, wells = sim_board.evaluate()
+
+        info = {
+            'score':      score,
+            'lines':      lines,
+            'height':     h,
+            'holes':      holes,
+            'bumpiness':  bump,
+            'max_height': max_h,
+            'well_depth': wells,
+            'rotation':   rot,
+            'column':     col,
+        }
+        return score, info
+
+    def find_best_move(self, board: 'Board', piece: 'Piece',
+                       next_piece: 'Piece' = None):
+        """Try all rotations × columns with conditional next-piece lookahead.
+        Lookahead activates when the board is getting dangerous (max_height > 10).
+        Returns (rotation, x, heuristic_info)."""
         best_score = float('-inf')
         best       = (0, piece.x)
         best_info  = {}
 
-        for rot in range(4):
-            for col in range(-2, BOARD_W + 2):
-                sim_piece = Piece(piece.name)
-                sim_piece.rotation = rot
-                sim_piece.x = col
+        # Only do lookahead when board is getting dangerous
+        max_h = board.max_height()
+        use_lookahead = (next_piece is not None and max_h > 10)
 
-                # Drop the piece down
-                sim_piece.y = -2
-                valid_start = False
-                while True:
-                    next_cells = [(sim_piece.x + dx, sim_piece.y + 1 + dy)
-                                  for (dx, dy) in SHAPES[sim_piece.name][rot]]
-                    if board.is_valid(next_cells):
-                        sim_piece.y += 1
-                        valid_start = True
+        # O-piece has identical rotations, skip duplicates
+        num_rots = 1 if piece.name == 'O' else 4
+
+        for rot in range(num_rots):
+            for col in range(-2, BOARD_W):
+                result = self._score_placement(
+                    board, piece.name, piece.color, rot, col)
+                if result is None:
+                    continue
+
+                base_score, info = result
+
+                # ── Conditional next-piece lookahead ─────────────────────
+                if use_lookahead:
+                    cells, _ = self._hard_drop_piece(board, piece.name, rot, col)
+                    lookahead_board = board.copy()
+                    lookahead_board.lock(cells, piece.color)
+                    lookahead_board.clear_lines()
+
+                    best_next_score = float('-inf')
+                    n_rots = 1 if next_piece.name == 'O' else 4
+                    for n_rot in range(n_rots):
+                        for n_col in range(-2, BOARD_W):
+                            n_result = self._score_placement(
+                                lookahead_board, next_piece.name,
+                                next_piece.color, n_rot, n_col)
+                            if n_result is not None:
+                                n_score, _ = n_result
+                                if n_score > best_next_score:
+                                    best_next_score = n_score
+
+                    if best_next_score > float('-inf'):
+                        combined_score = base_score + 0.4 * best_next_score
                     else:
-                        break
+                        combined_score = base_score
+                else:
+                    combined_score = base_score
 
-                cells = [(sim_piece.x + dx, sim_piece.y + dy)
-                         for (dx, dy) in SHAPES[sim_piece.name][rot]]
-
-                # Skip if invalid (piece never moved into board)
-                if not board.is_valid(cells) and not valid_start:
-                    continue
-                if not all(0 <= x < BOARD_W for x, y in cells):
-                    continue
-                # Ensure at least one cell is inside board vertically
-                if not any(0 <= y < BOARD_H for x, y in cells):
-                    continue
-
-                sim_board = board.copy()
-                sim_board.lock(cells, piece.color)
-                score, lines, h, holes, bump = sim_board.evaluate()
-
-                if score > best_score:
-                    best_score = score
+                if combined_score > best_score:
+                    best_score = combined_score
                     best = (rot, col)
-                    best_info = {
-                        'score':     score,
-                        'lines':     lines,
-                        'height':    h,
-                        'holes':     holes,
-                        'bumpiness': bump,
-                        'rotation':  rot,
-                        'column':    col,
-                    }
+                    best_info = info
+                    best_info['combined_score'] = combined_score
 
         return best[0], best[1], best_info
 
@@ -283,8 +379,8 @@ class TetrisGame:
         # Timing
         self.fall_delay   = 0.5    # seconds between auto‑drops
         self.last_fall    = time.time()
-        self.last_lock    = time.time()
-        self.lock_delay   = 0.4
+        self.lock_timer   = None   # lock delay timer (human mode)
+        self.lock_delay   = 0.4    # seconds before auto-lock
 
         # AI state
         self.ai         = AISolver()
@@ -292,21 +388,24 @@ class TetrisGame:
         self.ai_target_x   = 0
         self.ai_info       = {}
         self.ai_move_timer = 0
-        self.ai_move_delay = 0.07     # seconds between each AI micro-step
+        self.ai_move_delay = 0.05     # seconds between each AI micro-step
         self.ai_thinking   = False
         self.ai_history    = []       # last N evaluations for graph
+        self.ai_rot_attempts = 0      # track rotation attempts to prevent stuck
         self._plan_ai_move()
 
     # ── Helpers ──────────────────────────────────────────────────────────────
     def _plan_ai_move(self):
         if not self.ai_mode:
             return
-        rot, x, info = self.ai.find_best_move(self.board, self.piece)
+        rot, x, info = self.ai.find_best_move(
+            self.board, self.piece, self.next_piece)
         self.ai_target_rot = rot
         self.ai_target_x   = x
         self.ai_info       = info
         self.ai_thinking   = True
         self.ai_move_timer = time.time()
+        self.ai_rot_attempts = 0
 
     def _ghost_cells(self):
         ghost = Piece(self.piece.name)
@@ -327,11 +426,14 @@ class TetrisGame:
         self.piece = self.next_piece
         self.next_piece = Piece()
         self.last_fall = time.time()
+        self.lock_timer = None  # reset lock timer
 
-        # Check game over
-        if not self.board.is_valid(self.piece.cells):
-            self.game_over = True
-            return
+        # Check game over — if the new piece overlaps existing blocks
+        # even above the visible board, it's game over
+        for (x, y) in self.piece.cells:
+            if y >= 0 and self.board.grid[y][x] is not None:
+                self.game_over = True
+                return
 
         if self.ai_mode:
             self._plan_ai_move()
@@ -348,18 +450,26 @@ class TetrisGame:
             if event.key == pygame.K_LEFT:
                 if self.board.is_valid(self.piece.moved(dx=-1)):
                     self.piece.x -= 1
+                    # Reset lock timer on successful move
+                    if self.lock_timer is not None:
+                        self.lock_timer = time.time()
             elif event.key == pygame.K_RIGHT:
                 if self.board.is_valid(self.piece.moved(dx=1)):
                     self.piece.x += 1
+                    if self.lock_timer is not None:
+                        self.lock_timer = time.time()
             elif event.key == pygame.K_DOWN:
                 if self.board.is_valid(self.piece.moved(dy=1)):
                     self.piece.y += 1
                     self.score += 1
+                    self.lock_timer = None  # moved down, not on ground anymore
             elif event.key == pygame.K_UP:
                 new_rot = (self.piece.rotation + 1) % 4
                 new_cells = self.piece.rotated(new_rot)
                 if self.board.is_valid(new_cells):
                     self.piece.rotation = new_rot
+                    if self.lock_timer is not None:
+                        self.lock_timer = time.time()
                 else:
                     # Wall kick
                     for dx in [1, -1, 2, -2]:
@@ -367,6 +477,8 @@ class TetrisGame:
                         if self.board.is_valid(kicked):
                             self.piece.rotation = new_rot
                             self.piece.x += dx
+                            if self.lock_timer is not None:
+                                self.lock_timer = time.time()
                             break
             elif event.key == pygame.K_SPACE:
                 while self.board.is_valid(self.piece.moved(dy=1)):
@@ -386,41 +498,76 @@ class TetrisGame:
         if self.ai_mode and self.ai_thinking:
             if now - self.ai_move_timer >= self.ai_move_delay:
                 self.ai_move_timer = now
-                moved = False
 
-                # Rotate first
+                # Rotate first (with stuck detection)
                 if self.piece.rotation != self.ai_target_rot:
-                    new_rot = (self.piece.rotation + 1) % 4
+                    # Try shortest rotation path
+                    cur = self.piece.rotation
+                    target = self.ai_target_rot
+                    # Determine direction: clockwise or counter-clockwise
+                    cw_steps = (target - cur) % 4
+                    ccw_steps = (cur - target) % 4
+                    if cw_steps <= ccw_steps:
+                        new_rot = (cur + 1) % 4
+                    else:
+                        new_rot = (cur - 1) % 4
+
                     new_cells = self.piece.rotated(new_rot)
                     if self.board.is_valid(new_cells):
                         self.piece.rotation = new_rot
-                    moved = True
+                        self.ai_rot_attempts = 0
+                    else:
+                        # Try wall kicks for rotation
+                        kicked = False
+                        for dx in [1, -1, 2, -2]:
+                            kick_cells = [(x+dx, y) for x, y in new_cells]
+                            if self.board.is_valid(kick_cells):
+                                self.piece.rotation = new_rot
+                                self.piece.x += dx
+                                self.ai_rot_attempts = 0
+                                kicked = True
+                                break
+                        if not kicked:
+                            self.ai_rot_attempts += 1
+                            # Give up on rotation after 4 failed attempts
+                            if self.ai_rot_attempts >= 4:
+                                self.ai_target_rot = self.piece.rotation
+                                self.ai_rot_attempts = 0
 
                 # Then slide horizontally
                 elif self.piece.x < self.ai_target_x:
                     if self.board.is_valid(self.piece.moved(dx=1)):
                         self.piece.x += 1
-                    moved = True
+                    else:
+                        # Can't reach target, accept current position
+                        self.ai_target_x = self.piece.x
                 elif self.piece.x > self.ai_target_x:
                     if self.board.is_valid(self.piece.moved(dx=-1)):
                         self.piece.x -= 1
-                    moved = True
-                else:
-                    # Drop it fast
-                    if self.board.is_valid(self.piece.moved(dy=1)):
-                        self.piece.y += 1
                     else:
-                        self._lock_piece()
-                        self.ai_thinking = False
+                        self.ai_target_x = self.piece.x
+                else:
+                    # At target position — hard drop
+                    while self.board.is_valid(self.piece.moved(dy=1)):
+                        self.piece.y += 1
+                    self._lock_piece()
+                    # _lock_piece() already calls _plan_ai_move() which
+                    # sets ai_thinking = True for the next piece.
+                    # Do NOT reset ai_thinking here.
 
-        # Gravity for human mode
+        # Gravity for human mode (with lock delay)
         if not self.ai_mode:
             if now - self.last_fall >= self.fall_delay:
                 self.last_fall = now
                 if self.board.is_valid(self.piece.moved(dy=1)):
                     self.piece.y += 1
+                    self.lock_timer = None  # still falling
                 else:
-                    self._lock_piece()
+                    # Piece can't move down — start or check lock timer
+                    if self.lock_timer is None:
+                        self.lock_timer = now
+                    elif now - self.lock_timer >= self.lock_delay:
+                        self._lock_piece()
 
         # Gravity for AI (while not thinking / after position reached)
         if self.ai_mode and not self.ai_thinking:
@@ -591,11 +738,15 @@ class Renderer:
         agg_h    = sum(heights)
         holes    = board.count_holes()
         bump     = board.bumpiness()
+        max_h    = board.max_height()
+        wells    = board.well_depth()
 
         stats = [
             ("Agg. Height",  agg_h,  (255, 120, 120), 200),
+            ("Max Height",   max_h,  (255,  80,  80), 20),
             ("Holes",        holes,  (255, 180,  80), 30),
             ("Bumpiness",    bump,   (180, 120, 255), 80),
+            ("Well Depth",   wells,  (100, 200, 255), 30),
         ]
         for label, val, color, max_val in stats:
             bar_w = max(0, min(PANEL_W - 100, int((val / max(max_val, 1)) * (PANEL_W - 100))))
@@ -604,61 +755,64 @@ class Renderer:
             pygame.draw.rect(self.screen, color, (px+16, y, bar_w, 10), border_radius=4)
             y += 14
 
-        y += 6
+        y += 4
         pygame.draw.line(self.screen, PANEL_EDGE, (px+10, y), (px+PANEL_W-10, y))
-        y += 8
+        y += 6
 
         # ── Best move info ────────────────────────────────────────────────────
-        y += self._text("BEST MOVE SELECTED", self.font_xs, GRAY, px+16, y) + 6
+        y += self._text("BEST MOVE SELECTED", self.font_xs, GRAY, px+16, y) + 4
 
         info = game.ai_info
         if info:
             rot_names = ["0°", "90°", "180°", "270°"]
             y += self._text(f"Rotation : {rot_names[info.get('rotation',0)]}",
-                             self.font_xs, (160,220,255), px+16, y) + 3
+                             self.font_xs, (160,220,255), px+16, y) + 2
             y += self._text(f"Column   : {info.get('column', '?')}",
-                             self.font_xs, (160,220,255), px+16, y) + 3
+                             self.font_xs, (160,220,255), px+16, y) + 2
             y += self._text(f"Score    : {info.get('score', 0):.4f}",
-                             self.font_xs, (100,255,180), px+16, y) + 10
+                             self.font_xs, (100,255,180), px+16, y) + 8
 
             # Component breakdown
-            y += self._text("HEURISTIC BREAKDOWN", self.font_xs, GRAY, px+16, y) + 6
+            y += self._text("HEURISTIC BREAKDOWN", self.font_xs, GRAY, px+16, y) + 4
 
             components = [
-                ("Lines Cleared",  info.get('lines',  0), WEIGHTS['lines_cleared'],      (100,255,100)),
-                ("Aggregate Ht",   info.get('height', 0), WEIGHTS['aggregate_height'],   (255,120,120)),
-                ("Holes",          info.get('holes',  0), WEIGHTS['holes'],              (255,180, 80)),
-                ("Bumpiness",      info.get('bumpiness',0), WEIGHTS['bumpiness'],         (180,120,255)),
+                ("Lines Cleared",  info.get('lines',  0),     WEIGHTS['complete_lines'],     (100,255,100)),
+                ("Aggregate Ht",   info.get('height', 0),     WEIGHTS['aggregate_height'],   (255,120,120)),
+                ("Holes",          info.get('holes',  0),     WEIGHTS['holes'],              (255,180, 80)),
+                ("Bumpiness",      info.get('bumpiness',0),   WEIGHTS['bumpiness'],          (180,120,255)),
+                ("Max Height",     info.get('max_height', 0), WEIGHTS['max_height'],         (255, 80, 80)),
+                ("Well Depth",     info.get('well_depth', 0), WEIGHTS['well_depth'],         (100,200,255)),
             ]
 
             for name, raw, weight, color in components:
                 contribution = weight * raw
-                y += self._text(f"{name}:", self.font_xs, WHITE, px+16, y) + 1
-                y += self._text(f"  raw={raw:.1f}  w={weight:.3f}  Δ={contribution:.3f}",
-                                 self.font_xs, color, px+16, y) + 5
+                y += self._text(f"{name}: raw={raw:.0f}  w={weight:.3f}  Δ={contribution:.3f}",
+                                 self.font_xs, color, px+16, y) + 3
 
-        y += 8
+        y += 6
         pygame.draw.line(self.screen, PANEL_EDGE, (px+10, y), (px+PANEL_W-10, y))
-        y += 8
+        y += 6
 
         # ── Weight legend ─────────────────────────────────────────────────────
-        y += self._text("HEURISTIC WEIGHTS", self.font_xs, GRAY, px+16, y) + 6
+        y += self._text("HEURISTIC WEIGHTS", self.font_xs, GRAY, px+16, y) + 4
         weight_info = [
-            ("lines_cleared",     WEIGHTS['lines_cleared'],     (100,255,100)),
+            ("complete_lines",    WEIGHTS['complete_lines'],    (100,255,100)),
             ("aggregate_height",  WEIGHTS['aggregate_height'],  (255,120,120)),
             ("holes",             WEIGHTS['holes'],             (255,180, 80)),
             ("bumpiness",         WEIGHTS['bumpiness'],         (180,120,255)),
+            ("max_height",        WEIGHTS['max_height'],        (255, 80, 80)),
+            ("well_depth",        WEIGHTS['well_depth'],        (100,200,255)),
         ]
         for wname, wval, wcolor in weight_info:
             bar_fill = int(abs(wval) * 120)
             rect_x = px + 16
             pygame.draw.rect(self.screen, DARK_GRAY, (rect_x, y+2, 120, 8), border_radius=3)
             pygame.draw.rect(self.screen, wcolor, (rect_x, y+2, bar_fill, 8), border_radius=3)
-            y += self._text(f"{wname}: {wval:+.4f}", self.font_xs, wcolor, px+148, y) + 11
+            y += self._text(f"{wname}: {wval:+.4f}", self.font_xs, wcolor, px+148, y) + 9
 
         y += 4
         pygame.draw.line(self.screen, PANEL_EDGE, (px+10, y), (px+PANEL_W-10, y))
-        y += 8
+        y += 6
 
         # ── Column heights mini-graph ─────────────────────────────────────────
         remaining = self.panel_h - (y - py) - 16
@@ -666,9 +820,9 @@ class Renderer:
             y += self._text("COLUMN HEIGHTS", self.font_xs, GRAY, px+16, y) + 4
             bar_area_h = min(remaining - 20, 60)
             bar_w_each = (PANEL_W - 36) // BOARD_W
-            max_h = max(heights) if max(heights) > 0 else 1
+            max_h_val = max(heights) if max(heights) > 0 else 1
             for i, h in enumerate(heights):
-                bh = int((h / max_h) * bar_area_h)
+                bh = int((h / max_h_val) * bar_area_h)
                 bx = px + 16 + i * bar_w_each
                 by = y + bar_area_h - bh
                 # Colour by height
@@ -713,7 +867,7 @@ class MenuScreen:
         self.t           = 0.0
         self.options     = [
             ("🎮  Play as Human",   "Classic keyboard-controlled Tetris",              False),
-            ("🤖  Watch AI Play",   "Heuristic AI with live analysis panel",            True),
+            ("🤖  Watch AI Play",   "6-feature heuristic AI with lookahead",           True),
         ]
 
     def draw(self):
