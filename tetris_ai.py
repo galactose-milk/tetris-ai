@@ -27,13 +27,19 @@ WINDOW_H = MARGIN + BOARD_H * CELL + MARGIN
 FPS = 60
 
 # ─── Colors ────────────────────────────────────────────────────────────────────
-BG          = (10, 10, 20)
-GRID_COLOR  = (30, 30, 50)
-PANEL_BG    = (18, 18, 35)
-PANEL_EDGE  = (60, 60, 100)
-WHITE       = (240, 240, 255)
-GRAY        = (120, 120, 150)
-DARK_GRAY   = (40, 40, 60)
+BG_TOP      = (6, 10, 22)
+BG_BOTTOM   = (18, 24, 42)
+BG          = BG_TOP
+GRID_COLOR  = (26, 32, 56)
+PANEL_BG    = (14, 18, 32)
+PANEL_EDGE  = (72, 88, 132)
+WHITE       = (242, 244, 255)
+GRAY        = (142, 150, 176)
+DARK_GRAY   = (34, 40, 58)
+ACCENT      = (0, 200, 255)
+ACCENT_2    = (255, 182, 72)
+SUCCESS     = (98, 224, 154)
+DANGER      = (255, 110, 122)
 GHOST_ALPHA = 80
 
 PIECE_COLORS = {
@@ -607,6 +613,7 @@ class Renderer:
         self.font_med   = pygame.font.SysFont("Segoe UI", 20, bold=True)
         self.font_sm    = pygame.font.SysFont("Segoe UI", 15)
         self.font_xs    = pygame.font.SysFont("Segoe UI", 13)
+        self.font_tag   = pygame.font.SysFont("Segoe UI", 12, bold=True)
         self.board_ox   = MARGIN
         self.board_oy   = MARGIN
         self.panel_x    = MARGIN + BOARD_W * CELL + MARGIN
@@ -638,9 +645,50 @@ class Renderer:
         self.screen.blit(surf, (x, y))
         return surf.get_height()
 
+    def _draw_background(self):
+        for y in range(WINDOW_H):
+            ratio = y / max(WINDOW_H - 1, 1)
+            r = int(BG_TOP[0] + (BG_BOTTOM[0] - BG_TOP[0]) * ratio)
+            g = int(BG_TOP[1] + (BG_BOTTOM[1] - BG_TOP[1]) * ratio)
+            b = int(BG_TOP[2] + (BG_BOTTOM[2] - BG_TOP[2]) * ratio)
+            pygame.draw.line(self.screen, (r, g, b), (0, y), (WINDOW_W, y))
+
+        glow = pygame.Surface((WINDOW_W, WINDOW_H), pygame.SRCALPHA)
+        pygame.draw.circle(glow, (0, 200, 255, 22), (WINDOW_W - 90, 90), 180)
+        pygame.draw.circle(glow, (255, 182, 72, 16), (120, WINDOW_H - 120), 220)
+        pygame.draw.circle(glow, (120, 90, 255, 14), (WINDOW_W // 2, 120), 260)
+        self.screen.blit(glow, (0, 0))
+
+    def _panel_shell(self, rect, accent=PANEL_EDGE):
+        shadow = pygame.Surface((rect.width + 18, rect.height + 18), pygame.SRCALPHA)
+        pygame.draw.rect(shadow, (0, 0, 0, 90), shadow.get_rect(), border_radius=20)
+        self.screen.blit(shadow, (rect.x - 5, rect.y + 9))
+        pygame.draw.rect(self.screen, PANEL_BG, rect, border_radius=20)
+        pygame.draw.rect(self.screen, accent, rect, 2, border_radius=20)
+
+    def _card(self, rect, fill=DARK_GRAY, accent=None):
+        pygame.draw.rect(self.screen, fill, rect, border_radius=14)
+        if accent is not None:
+            pygame.draw.rect(self.screen, accent, rect, 2, border_radius=14)
+
+    def _badge(self, text, x, y, color, fill=None):
+        fill = fill or (18, 22, 38)
+        pad_x, pad_y = 12, 5
+        surf = self.font_tag.render(text, True, color)
+        rect = pygame.Rect(x, y, surf.get_width() + pad_x * 2, surf.get_height() + pad_y * 2)
+        pygame.draw.rect(self.screen, fill, rect, border_radius=999)
+        pygame.draw.rect(self.screen, color, rect, 1, border_radius=999)
+        self.screen.blit(surf, (rect.x + pad_x, rect.y + pad_y))
+        return rect
+
+    def _stat_card(self, rect, label, value, color):
+        self._card(rect, fill=(20, 26, 46), accent=color)
+        self._text(label, self.font_xs, GRAY, rect.centerx, rect.y + 8, 'center')
+        self._text(str(value), self.font_big, WHITE, rect.centerx, rect.y + 24, 'center')
+
     # ── Main draw ─────────────────────────────────────────────────────────────
     def draw(self, game: TetrisGame):
-        self.screen.fill(BG)
+        self._draw_background()
         self._draw_board_bg()
         self._draw_locked(game.board)
         if not game.game_over and not game.paused:
@@ -665,10 +713,14 @@ class Renderer:
         pygame.display.flip()
 
     def _draw_board_bg(self):
+        board_rect = pygame.Rect(self.board_ox - 6, self.board_oy - 6,
+                                 BOARD_W * CELL + 12, BOARD_H * CELL + 12)
+        pygame.draw.rect(self.screen, (9, 12, 24), board_rect, border_radius=18)
+        pygame.draw.rect(self.screen, (40, 48, 74), board_rect, 1, border_radius=18)
         for y in range(BOARD_H):
             for x in range(BOARD_W):
                 r = self._cell_rect(x, y)
-                pygame.draw.rect(self.screen, GRID_COLOR, r, border_radius=2)
+                pygame.draw.rect(self.screen, GRID_COLOR, r, border_radius=4)
 
     def _draw_locked(self, board):
         for y in range(BOARD_H):
@@ -695,64 +747,83 @@ class Renderer:
     # ── Human panel ───────────────────────────────────────────────────────────
     def _draw_human_panel(self, game):
         px, py = self.panel_x, self.panel_y
-        pygame.draw.rect(self.screen, PANEL_BG,
-                         (px, py, PANEL_W, self.panel_h), border_radius=8)
-        pygame.draw.rect(self.screen, PANEL_EDGE,
-                         (px, py, PANEL_W, self.panel_h), 2, border_radius=8)
+        panel_rect = pygame.Rect(px, py, PANEL_W, self.panel_h)
+        self._panel_shell(panel_rect, accent=(95, 150, 255))
 
         y = py + 16
-        y += self._text("TETRIS", self.font_big, (100,200,255), px + PANEL_W//2, y, 'center') + 10
+        self._text("TETRIS", self.font_big, WHITE, px + PANEL_W // 2, y, 'center')
+        y += 32
+        self._badge("HUMAN MODE", px + PANEL_W // 2 - 58, y, ACCENT, fill=(16, 28, 38))
+        y += 26
 
-        # Score / level / lines
-        for label, val in [("SCORE", game.score), ("LEVEL", game.level), ("LINES", game.lines)]:
-            y += self._text(label, self.font_xs, GRAY, px+16, y) + 2
-            y += self._text(str(val), self.font_big, WHITE, px+16, y) + 14
+        card_w = (PANEL_W - 44) // 3
+        card_h = 70
+        stats = [("SCORE", game.score, ACCENT), ("LEVEL", game.level, ACCENT_2), ("LINES", game.lines, SUCCESS)]
+        for i, (label, val, color) in enumerate(stats):
+            r = pygame.Rect(px + 16 + i * (card_w + 6), y, card_w, card_h)
+            self._stat_card(r, label, val, color)
 
-        # Next piece
-        y += 10
-        y += self._text("NEXT", self.font_xs, GRAY, px+16, y) + 6
-        self._draw_next_piece(game.next_piece, px+16, y)
-        y += 90
+        y += card_h + 14
 
-        # Controls
-        y += 10
-        y += self._text("CONTROLS", self.font_xs, GRAY, px+16, y) + 6
-        for line in ["← → Move", "↑  Rotate", "↓  Soft Drop",
-                     "SPACE Hard Drop", "P  Pause", "ESC  Menu"]:
-            y += self._text(line, self.font_xs, (160,160,200), px+20, y) + 3
+        next_card = pygame.Rect(px + 16, y, PANEL_W - 32, 122)
+        self._card(next_card, fill=(18, 24, 42), accent=ACCENT_2)
+        self._text("NEXT PIECE", self.font_xs, GRAY, next_card.x + 12, next_card.y + 10)
+        self._draw_next_piece(game.next_piece, next_card.x + 12, next_card.y + 28)
+
+        y += 138
+
+        controls_card = pygame.Rect(px + 16, y, PANEL_W - 32, 138)
+        self._card(controls_card, fill=(18, 24, 42), accent=PANEL_EDGE)
+        self._text("CONTROLS", self.font_xs, GRAY, controls_card.x + 12, controls_card.y + 10)
+        controls = ["← → Move", "↑ Rotate", "↓ Soft Drop",
+                    "SPACE Hard Drop", "P Pause", "ESC Menu"]
+        for i, line in enumerate(controls):
+            self._text(line, self.font_xs, WHITE if i < 3 else GRAY,
+                       controls_card.x + 14, controls_card.y + 32 + i * 15)
 
     # ── AI panel ────────────────────────────────────────────────────────────────
     def _draw_ai_panel(self, game):
         px, py = self.panel_x, self.panel_y
-        pygame.draw.rect(self.screen, PANEL_BG,
-                         (px, py, PANEL_W, self.panel_h), border_radius=8)
-        pygame.draw.rect(self.screen, PANEL_EDGE,
-                         (px, py, PANEL_W, self.panel_h), 2, border_radius=8)
+        panel_rect = pygame.Rect(px, py, PANEL_W, self.panel_h)
+        self._panel_shell(panel_rect, accent=(0, 200, 255))
 
         y = py + 14
 
         # Title
         y += self._text("AI HEURISTIC ENGINE", self.font_med,
-                         (80,220,170), px + PANEL_W//2, y, 'center') + 4
+                         ACCENT, px + PANEL_W//2, y, 'center') + 4
+        self._badge("WATCH MODE", px + PANEL_W // 2 - 54, y, SUCCESS, fill=(16, 28, 38))
+        y += 28
         pygame.draw.line(self.screen, PANEL_EDGE,
                          (px+10, y), (px+PANEL_W-10, y))
         y += 10
 
         # Score / level / lines
-        col2 = px + PANEL_W // 2
-        y += self._text("SCORE", self.font_xs, GRAY, px+16, y) + 2
-        y += self._text(str(game.score), self.font_big, WHITE, px+16, y) + 2
-        self._text("LEVEL", self.font_xs, GRAY, col2, y-24)
-        self._text(str(game.level), self.font_big, (255,200,50), col2, y-10)
-        y += 4
-        y += self._text(f"Lines cleared: {game.lines}", self.font_xs,
-                         (180,180,220), px+16, y) + 10
+        card_w = (PANEL_W - 44) // 3
+        card_h = 68
+        stats = [("SCORE", game.score, ACCENT), ("LEVEL", game.level, ACCENT_2), ("LINES", game.lines, SUCCESS)]
+        for i, (label, val, color) in enumerate(stats):
+            r = pygame.Rect(px + 16 + i * (card_w + 6), y, card_w, card_h)
+            self._stat_card(r, label, val, color)
+
+        y += card_h + 14
+
+        info_card = pygame.Rect(px + 16, y, PANEL_W - 32, 110)
+        self._card(info_card, fill=(18, 24, 42), accent=(125, 95, 255))
+        self._text("CURRENT BOARD", self.font_xs, GRAY, info_card.x + 12, info_card.y + 10)
+
+        self._text(f"Lines cleared: {game.lines}", self.font_xs, WHITE, info_card.x + 12, info_card.y + 34)
+        self._text(f"Max height: {game.board.max_height()}", self.font_xs, WHITE, info_card.x + 12, info_card.y + 49)
+        self._text(f"Holes: {game.board.count_holes()}", self.font_xs, WHITE, info_card.x + 12, info_card.y + 64)
+        self._text(f"Bumpiness: {game.board.bumpiness()}", self.font_xs, WHITE, info_card.x + 12, info_card.y + 79)
+
+        y += 122
 
         pygame.draw.line(self.screen, PANEL_EDGE, (px+10, y), (px+PANEL_W-10, y))
         y += 8
 
         # ── Current board state ─────────────────────────────────────────────
-        y += self._text("CURRENT BOARD STATE", self.font_xs, GRAY, px+16, y) + 6
+        y += self._text("LIVE HEURISTICS", self.font_xs, GRAY, px+16, y) + 6
 
         board = game.board
         heights  = board.column_heights()
@@ -880,7 +951,7 @@ class Renderer:
 class MenuScreen:
     def __init__(self, screen):
         self.screen = screen
-        self.font_title  = pygame.font.SysFont("Segoe UI", 64, bold=True)
+        self.font_title  = pygame.font.SysFont("Segoe UI", 60, bold=True)
         self.font_sub    = pygame.font.SysFont("Segoe UI", 22)
         self.font_btn    = pygame.font.SysFont("Segoe UI", 26, bold=True)
         self.font_desc   = pygame.font.SysFont("Segoe UI", 15)
@@ -891,36 +962,81 @@ class MenuScreen:
             ("🤖  Watch AI Play",   "6-feature heuristic AI with lookahead",           True),
         ]
 
+    def _badge(self, text, x, y, color, fill=None):
+        fill = fill or (18, 22, 38)
+        pad_x, pad_y = 12, 5
+        surf = self.font_desc.render(text, True, color)
+        rect = pygame.Rect(x, y, surf.get_width() + pad_x * 2, surf.get_height() + pad_y * 2)
+        pygame.draw.rect(self.screen, fill, rect, border_radius=999)
+        pygame.draw.rect(self.screen, color, rect, 1, border_radius=999)
+        self.screen.blit(surf, (rect.x + pad_x, rect.y + pad_y))
+        return rect
+
     def draw(self):
         self.t += 0.02
         # Animated gradient background
         for y in range(WINDOW_H):
             ratio = y / WINDOW_H
-            r = max(0, min(255, int(10 + 15*math.sin(self.t + ratio*3))))
-            g = max(0, min(255, int(10 + 10*math.sin(self.t*0.7 + ratio*2))))
-            b = max(0, min(255, int(20 + 30*math.sin(self.t*0.5 + ratio))))
+            r = max(0, min(255, int(8 + 16 * math.sin(self.t + ratio * 3.2))))
+            g = max(0, min(255, int(12 + 10 * math.sin(self.t * 0.7 + ratio * 2.2))))
+            b = max(0, min(255, int(24 + 28 * math.sin(self.t * 0.5 + ratio))))
             pygame.draw.line(self.screen, (r, g, b), (0, y), (WINDOW_W, y))
+
+        mist = pygame.Surface((WINDOW_W, WINDOW_H), pygame.SRCALPHA)
+        pygame.draw.circle(mist, (0, 200, 255, 28), (WINDOW_W - 120, 100), 190)
+        pygame.draw.circle(mist, (255, 182, 72, 18), (120, WINDOW_H - 120), 220)
+        pygame.draw.circle(mist, (255, 255, 255, 10), (WINDOW_W // 2, 160), 300)
+        self.screen.blit(mist, (0, 0))
 
         cx = WINDOW_W // 2
 
+        card = pygame.Rect(cx - 250, 58, 500, 470)
+        shadow = pygame.Surface((card.width + 18, card.height + 18), pygame.SRCALPHA)
+        pygame.draw.rect(shadow, (0, 0, 0, 92), shadow.get_rect(), border_radius=28)
+        self.screen.blit(shadow, (card.x - 6, card.y + 10))
+        pygame.draw.rect(self.screen, (14, 18, 34), card, border_radius=28)
+        pygame.draw.rect(self.screen, ACCENT, card, 2, border_radius=28)
+
         # Animated title
         wave_y = int(4 * math.sin(self.t * 2))
-        title_surf = self.font_title.render("TETRIS", True, (0, 0, 0))
-        # Glow layers
-        glow_colors = [(0,80,120),(0,120,180),(0,180,220),(0,220,255),(255,255,255)]
+        title = self.font_title.render("TETRIS", True, WHITE)
+        glow_colors = [(0, 80, 120), (0, 120, 180), (0, 180, 220), (0, 220, 255), (255, 255, 255)]
         for i, gc in enumerate(glow_colors):
             ts = self.font_title.render("TETRIS", True, gc)
-            self.screen.blit(ts, (cx - ts.get_width()//2 + (i-2)*0.5,
-                                  80 + wave_y + (i-2)*0.5))
+            self.screen.blit(ts, (cx - ts.get_width() // 2 + (i - 2) * 0.5,
+                                  86 + wave_y + (i - 2) * 0.5))
 
-        sub = self.font_sub.render("A I   E D I T I O N", True, (100,200,255))
-        self.screen.blit(sub, (cx - sub.get_width()//2, 155))
+        sub = self.font_sub.render("AI EDITION", True, ACCENT)
+        self.screen.blit(sub, (cx - sub.get_width() // 2, 156))
+
+        # Draw two badges centered under the subtitle
+        b1_text = "Win: clear 40 lines"
+        b2_text = "Lose: stack reaches the roof"
+        pad_x, pad_y = 12, 5
+        b1_surf = self.font_desc.render(b1_text, True, SUCCESS)
+        b2_surf = self.font_desc.render(b2_text, True, DANGER)
+        b1_w = b1_surf.get_width() + pad_x * 2
+        b2_w = b2_surf.get_width() + pad_x * 2
+        spacing = 14
+        total_w = b1_w + spacing + b2_w
+        start_x = cx - total_w // 2
+        b_y = 194
+        # badge 1
+        rect1 = pygame.Rect(start_x, b_y, b1_w, b1_surf.get_height() + pad_y * 2)
+        pygame.draw.rect(self.screen, (16, 28, 38), rect1, border_radius=999)
+        pygame.draw.rect(self.screen, SUCCESS, rect1, 1, border_radius=999)
+        self.screen.blit(b1_surf, (rect1.x + pad_x, rect1.y + pad_y))
+        # badge 2
+        rect2 = pygame.Rect(start_x + b1_w + spacing, b_y, b2_w, b2_surf.get_height() + pad_y * 2)
+        pygame.draw.rect(self.screen, (28, 18, 24), rect2, border_radius=999)
+        pygame.draw.rect(self.screen, DANGER, rect2, 1, border_radius=999)
+        self.screen.blit(b2_surf, (rect2.x + pad_x, rect2.y + pad_y))
 
         # Buttons
-        btn_w, btn_h = 400, 80
+        btn_w, btn_h = 400, 72
         for i, (label, desc, _) in enumerate(self.options):
             bx = cx - btn_w//2
-            by = 240 + i * 110
+            by = 245 + i * 100
             # Glow on hover
             hover = (self.selected == i)
             if hover:
@@ -936,14 +1052,19 @@ class MenuScreen:
             pygame.draw.rect(self.screen, bg_col, (bx, by, btn_w, btn_h), border_radius=14)
             pygame.draw.rect(self.screen, border, (bx, by, btn_w, btn_h), 2, border_radius=14)
 
+            # removed thin white overlay used previously for hover highlight
+
             ts = self.font_btn.render(label, True, WHITE)
-            self.screen.blit(ts, (bx + 24, by + 14))
+            self.screen.blit(ts, (bx + 24, by + 12))
             ds = self.font_desc.render(desc, True, GRAY)
-            self.screen.blit(ds, (bx + 26, by + 48))
+            self.screen.blit(ds, (bx + 26, by + 42))
 
         # Navigation hint
-        hint = self.font_desc.render("↑ ↓  Navigate    ENTER  Select", True, (80,80,110))
-        self.screen.blit(hint, (cx - hint.get_width()//2, WINDOW_H - 40))
+        hint = self.font_desc.render("↑ ↓ Navigate    ENTER Select", True, (90, 102, 132))
+        self.screen.blit(hint, (cx - hint.get_width()//2, WINDOW_H - 44))
+
+        win_text = self.font_desc.render("Win condition: clear 40 lines", True, ACCENT)
+        self.screen.blit(win_text, (cx - win_text.get_width()//2, WINDOW_H - 66))
 
         pygame.display.flip()
 
@@ -965,6 +1086,7 @@ def main():
     pygame.init()
     screen = pygame.display.set_mode((WINDOW_W, WINDOW_H))
     pygame.display.set_caption("Tetris AI Edition")
+    
     clock  = pygame.time.Clock()
 
     state  = "menu"      # "menu" | "game"
