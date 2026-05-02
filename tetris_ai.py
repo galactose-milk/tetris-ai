@@ -425,6 +425,10 @@ class TetrisGame:
         return ghost.cells
 
     def _lock_piece(self):
+        if any(y < 0 for (x, y) in self.piece.cells):
+            self._end_game("lost")
+            return
+
         self.board.lock(self.piece.cells, self.piece.color)
         cleared = self.board.clear_lines()
         self.lines += cleared
