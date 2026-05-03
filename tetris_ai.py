@@ -104,7 +104,7 @@ PIECE_NAMES = list(SHAPES.keys())
 # GA-optimized weights from Yiyuan Lee's research + additional robustness features
 # These were computed via genetic algorithm on the unit 3-sphere and extended
 # with max_height and well_depth penalties for practical robustness.
-WEIGHTS = {
+DEFAULT_WEIGHTS = {
     'complete_lines':    0.760666,   # reward clearing lines
     'aggregate_height': -0.510066,   # penalize tall stacks
     'holes':            -0.35663,    # penalize buried gaps
@@ -112,6 +112,12 @@ WEIGHTS = {
     'max_height':       -0.30,       # penalize tallest column spikes
     'well_depth':       -0.15,       # penalize deep wells
 }
+
+CUSTOM_WEIGHT_RANGE = (-1.5, 1.5)
+
+
+def clamp(value, low, high):
+    return max(low, min(high, value))
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  BOARD CLASS
@@ -202,9 +208,10 @@ class Board:
             total += well
         return total
 
-    def evaluate(self):
+    def evaluate(self, weights=None):
         """Evaluate board state with 6-feature heuristic.
         Returns (score, lines, agg_h, holes, bump, max_h, wells)."""
+        weights = weights or DEFAULT_WEIGHTS
         temp_board = self.copy()
         lines  = temp_board.clear_lines()
         agg_h  = temp_board.aggregate_height()
@@ -213,12 +220,12 @@ class Board:
         max_h  = temp_board.max_height()
         wells  = temp_board.well_depth()
 
-        score = (WEIGHTS['complete_lines']    * lines +
-                 WEIGHTS['aggregate_height']  * agg_h +
-                 WEIGHTS['holes']             * holes +
-                 WEIGHTS['bumpiness']         * bump  +
-                 WEIGHTS['max_height']        * max_h +
-                 WEIGHTS['well_depth']        * wells)
+        score = (weights['complete_lines']    * lines +
+                 weights['aggregate_height']  * agg_h +
+                 weights['holes']             * holes +
+                 weights['bumpiness']         * bump  +
+                 weights['max_height']        * max_h +
+                 weights['well_depth']        * wells)
         return score, lines, agg_h, holes, bump, max_h, wells
 
 
@@ -248,11 +255,78 @@ class Piece:
             cells.append((cx+dx, cy+dy))
         return cells
 
+class WeightSlider:
+    def __init__(self, key, label, color, value, min_value=None, max_value=None):
+        self.key = key
+        self.label = label
+        self.color = color
+        self.value = value
+        self.min_value = CUSTOM_WEIGHT_RANGE[0] if min_value is None else min_value
+        self.max_value = CUSTOM_WEIGHT_RANGE[1] if max_value is None else max_value
+        self.dragging = False
+        self.row_rect = pygame.Rect(0, 0, 0, 0)
+        self.track_rect = pygame.Rect(0, 0, 0, 0)
+
+    def layout(self, x, y, width):
+        self.row_rect = pygame.Rect(x, y, width, 28)
+        label_w = 96
+        value_w = 60
+        track_x = x + label_w
+        track_w = max(20, width - label_w - value_w - 12)
+        self.track_rect = pygame.Rect(track_x, y + 11, track_w, 6)
+
+    def _value_from_x(self, x):
+        if self.track_rect.width <= 0:
+            return self.value
+        ratio = clamp((x - self.track_rect.x) / self.track_rect.width, 0.0, 1.0)
+        return self.min_value + ratio * (self.max_value - self.min_value)
+
+    def set_value(self, value):
+        self.value = clamp(value, self.min_value, self.max_value)
+
+    def handle_event(self, event):
+        changed = False
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            if self.row_rect.collidepoint(event.pos):
+                self.dragging = True
+                self.set_value(self._value_from_x(event.pos[0]))
+                changed = True
+        elif event.type == pygame.MOUSEMOTION and self.dragging:
+            self.set_value(self._value_from_x(event.pos[0]))
+            changed = True
+        elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+            self.dragging = False
+        return changed
+
+    def draw(self, screen, font, value_font):
+        label_surf = font.render(self.label, True, WHITE)
+        screen.blit(label_surf, (self.row_rect.x, self.row_rect.y + 4))
+
+        pygame.draw.rect(screen, DARK_GRAY, self.track_rect, border_radius=4)
+        ratio = (self.value - self.min_value) / max(self.max_value - self.min_value, 1e-9)
+        fill_w = int(self.track_rect.width * clamp(ratio, 0.0, 1.0))
+        if fill_w > 0:
+            pygame.draw.rect(screen, self.color,
+                             (self.track_rect.x, self.track_rect.y, fill_w, self.track_rect.height),
+                             border_radius=4)
+
+        knob_x = self.track_rect.x + fill_w
+        knob_rect = pygame.Rect(0, 0, 12, 18)
+        knob_rect.center = (knob_x, self.track_rect.centery)
+        pygame.draw.rect(screen, WHITE, knob_rect, border_radius=4)
+        pygame.draw.rect(screen, self.color, knob_rect, 2, border_radius=4)
+
+        value_surf = value_font.render(f"{self.value:+.3f}", True, self.color)
+        screen.blit(value_surf, (self.row_rect.right - value_surf.get_width(), self.row_rect.y + 5))
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  AI SOLVER
 # ══════════════════════════════════════════════════════════════════════════════
 class AISolver:
+    def __init__(self, weights=None):
+        self.weights = weights or dict(DEFAULT_WEIGHTS)
+
     @staticmethod
     def _hard_drop_piece(board, piece_name, rot, col):
         """Simulate dropping a piece from the top. Returns (cells, valid)."""
@@ -292,7 +366,7 @@ class AISolver:
 
         sim_board = board.copy()
         sim_board.lock(cells, piece_color)
-        score, lines, h, holes, bump, max_h, wells = sim_board.evaluate()
+        score, lines, h, holes, bump, max_h, wells = sim_board.evaluate(self.weights)
 
         info = {
             'score':      score,
@@ -371,8 +445,10 @@ class AISolver:
 #  GAME CLASS
 # ══════════════════════════════════════════════════════════════════════════════
 class TetrisGame:
-    def __init__(self, ai_mode=False):
-        self.ai_mode    = ai_mode
+    def __init__(self, mode="human"):
+        self.mode       = mode
+        self.ai_mode    = mode in ("watch", "custom")
+        self.custom_mode = mode == "custom"
         self.board      = Board()
         self.piece      = Piece()
         self.next_piece = Piece()
@@ -384,6 +460,10 @@ class TetrisGame:
         self.result     = None   # "won" | "lost"
         self.win_lines_target = 40
 
+        # Heuristic tuning state
+        self.weights = dict(DEFAULT_WEIGHTS)
+        self.weight_sliders = self._build_weight_sliders() if self.custom_mode else []
+
         # Timing
         self.fall_delay   = 0.5    # seconds between auto‑drops
         self.last_fall    = time.time()
@@ -391,7 +471,7 @@ class TetrisGame:
         self.lock_delay   = 0.4    # seconds before auto-lock
 
         # AI state
-        self.ai         = AISolver()
+        self.ai         = AISolver(self.weights)
         self.ai_target_rot = 0
         self.ai_target_x   = 0
         self.ai_info       = {}
@@ -400,6 +480,8 @@ class TetrisGame:
         self.ai_thinking   = False
         self.ai_history    = []       # last N evaluations for graph
         self.ai_rot_attempts = 0      # track rotation attempts to prevent stuck
+        if self.custom_mode:
+            self._layout_weight_sliders()
         self._plan_ai_move()
 
     def _end_game(self, result):
@@ -407,6 +489,49 @@ class TetrisGame:
         self.result = result
         self.paused = False
         self.ai_thinking = False
+
+    def _build_weight_sliders(self):
+        return [
+            WeightSlider('complete_lines', 'Lines +', (100, 255, 100), self.weights['complete_lines']),
+            WeightSlider('aggregate_height', 'Height -', (255, 120, 120), self.weights['aggregate_height']),
+            WeightSlider('holes', 'Holes -', (255, 180, 80), self.weights['holes']),
+            WeightSlider('bumpiness', 'Bumpiness -', (180, 120, 255), self.weights['bumpiness']),
+            WeightSlider('max_height', 'Max H -', (255, 80, 80), self.weights['max_height']),
+            WeightSlider('well_depth', 'Wells -', (100, 200, 255), self.weights['well_depth']),
+        ]
+
+    def _layout_weight_sliders(self):
+        if not self.weight_sliders:
+            return
+        px = MARGIN + BOARD_W * CELL + MARGIN
+        x = px + 16
+        width = PANEL_W - 32
+        y = MARGIN + 338
+        for slider in self.weight_sliders:
+            slider.layout(x, y, width)
+            y += 30
+
+    def _sync_weight_sliders(self):
+        for slider in self.weight_sliders:
+            slider.set_value(self.weights[slider.key])
+
+    def _set_weight(self, key, value):
+        if key not in self.weights:
+            return
+        new_value = clamp(value, CUSTOM_WEIGHT_RANGE[0], CUSTOM_WEIGHT_RANGE[1])
+        if abs(self.weights[key] - new_value) < 1e-6:
+            return
+        self.weights[key] = new_value
+        self._sync_weight_sliders()
+        if self.ai_mode and not self.game_over:
+            self._plan_ai_move()
+
+    def reset_weights(self):
+        for key, value in DEFAULT_WEIGHTS.items():
+            self.weights[key] = value
+        self._sync_weight_sliders()
+        if self.ai_mode and not self.game_over:
+            self._plan_ai_move()
 
     # ── Helpers ──────────────────────────────────────────────────────────────
     def _plan_ai_move(self):
@@ -467,8 +592,25 @@ class TetrisGame:
 
     # ── Human Input ──────────────────────────────────────────────────────────
     def handle_event(self, event):
-        if self.game_over or self.ai_mode:
+        if self.game_over:
             return
+
+        if self.custom_mode:
+            if event.type in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEMOTION, pygame.MOUSEBUTTONUP):
+                changed = False
+                for slider in self.weight_sliders:
+                    if slider.handle_event(event):
+                        self._set_weight(slider.key, slider.value)
+                        changed = True
+                if changed:
+                    self._layout_weight_sliders()
+            elif event.type == pygame.KEYDOWN and event.key == pygame.K_r:
+                self.reset_weights()
+            return
+
+        if self.ai_mode:
+            return
+
         if event.type == pygame.KEYDOWN:
             if event.key == pygame.K_LEFT:
                 if self.board.is_valid(self.piece.moved(dx=-1)):
@@ -697,7 +839,10 @@ class Renderer:
         self._draw_border()
 
         if game.ai_mode:
-            self._draw_ai_panel(game)
+            if game.custom_mode:
+                self._draw_custom_ai_panel(game)
+            else:
+                self._draw_ai_panel(game)
         else:
             self._draw_human_panel(game)
 
@@ -730,6 +875,7 @@ class Renderer:
                     self.draw_cell(x, y, c)
 
     def _draw_piece(self, piece):
+
         for (x, y) in piece.cells:
             if y >= 0:
                 self.draw_cell(x, y, piece.color)
@@ -792,6 +938,7 @@ class Renderer:
         # Title
         y += self._text("AI HEURISTIC ENGINE", self.font_med,
                          ACCENT, px + PANEL_W//2, y, 'center') + 4
+
         self._badge("WATCH MODE", px + PANEL_W // 2 - 54, y, SUCCESS, fill=(16, 28, 38))
         y += 28
         pygame.draw.line(self.screen, PANEL_EDGE,
@@ -857,6 +1004,7 @@ class Renderer:
         info = game.ai_info
         if info:
             rot_names = ["0°", "90°", "180°", "270°"]
+
             y += self._text(f"Rotation : {rot_names[info.get('rotation',0)]}",
                              self.font_xs, (160,220,255), px+16, y) + 2
             y += self._text(f"Column   : {info.get('column', '?')}",
@@ -868,18 +1016,25 @@ class Renderer:
             y += self._text("HEURISTIC BREAKDOWN", self.font_xs, GRAY, px+16, y) + 4
 
             components = [
-                ("Lines Cleared",  info.get('lines',  0),     WEIGHTS['complete_lines'],     (100,255,100)),
-                ("Aggregate Ht",   info.get('height', 0),     WEIGHTS['aggregate_height'],   (255,120,120)),
-                ("Holes",          info.get('holes',  0),     WEIGHTS['holes'],              (255,180, 80)),
-                ("Bumpiness",      info.get('bumpiness',0),   WEIGHTS['bumpiness'],          (180,120,255)),
-                ("Max Height",     info.get('max_height', 0), WEIGHTS['max_height'],         (255, 80, 80)),
-                ("Well Depth",     info.get('well_depth', 0), WEIGHTS['well_depth'],         (100,200,255)),
+                ("Lines Cleared",  info.get('lines',  0),     game.weights['complete_lines'],     (100,255,100)),
+                ("Aggregate Ht",   info.get('height', 0),     game.weights['aggregate_height'],   (255,120,120)),
+                ("Holes",          info.get('holes',  0),     game.weights['holes'],              (255,180, 80)),
+                ("Bumpiness",      info.get('bumpiness',0),   game.weights['bumpiness'],          (180,120,255)),
+                ("Max Height",     info.get('max_height', 0), game.weights['max_height'],         (255, 80, 80)),
+                ("Well Depth",     info.get('well_depth', 0), game.weights['well_depth'],         (100,200,255)),
             ]
 
+            # Render breakdown in two columns to avoid horizontal overflow
             for name, raw, weight, color in components:
                 contribution = weight * raw
-                y += self._text(f"{name}: raw={raw:.0f}  w={weight:.3f}  Δ={contribution:.3f}",
-                                 self.font_xs, color, px+16, y) + 3
+                left_x = px + 16
+                right_x = px + PANEL_W - 16
+                # Name on the left
+                y += self._text(f"{name}", self.font_xs, color, left_x, y)
+                # Compact stats on the right (raw | Δ)
+                stats_txt = f"raw={int(raw)}  Δ={contribution:+.3f}"
+                self._text(stats_txt, self.font_xs, color, right_x, y - self.font_xs.get_height(), 'right')
+                y += 3
 
         y += 6
         pygame.draw.line(self.screen, PANEL_EDGE, (px+10, y), (px+PANEL_W-10, y))
@@ -888,12 +1043,12 @@ class Renderer:
         # ── Weight legend ─────────────────────────────────────────────────────
         y += self._text("HEURISTIC WEIGHTS", self.font_xs, GRAY, px+16, y) + 4
         weight_info = [
-            ("complete_lines",    WEIGHTS['complete_lines'],    (100,255,100)),
-            ("aggregate_height",  WEIGHTS['aggregate_height'],  (255,120,120)),
-            ("holes",             WEIGHTS['holes'],             (255,180, 80)),
-            ("bumpiness",         WEIGHTS['bumpiness'],         (180,120,255)),
-            ("max_height",        WEIGHTS['max_height'],        (255, 80, 80)),
-            ("well_depth",        WEIGHTS['well_depth'],        (100,200,255)),
+            ("complete_lines",    game.weights['complete_lines'],    (100,255,100)),
+            ("aggregate_height",  game.weights['aggregate_height'],  (255,120,120)),
+            ("holes",             game.weights['holes'],             (255,180, 80)),
+            ("bumpiness",         game.weights['bumpiness'],         (180,120,255)),
+            ("max_height",        game.weights['max_height'],        (255, 80, 80)),
+            ("well_depth",        game.weights['well_depth'],        (100,200,255)),
         ]
         for wname, wval, wcolor in weight_info:
             bar_fill = int(abs(wval) * 120)
@@ -928,6 +1083,65 @@ class Renderer:
         # Next piece
         self._draw_next_piece(game.next_piece, px + PANEL_W//2 - 32, py + 14)
 
+    def _draw_custom_ai_panel(self, game):
+        px, py = self.panel_x, self.panel_y
+        panel_rect = pygame.Rect(px, py, PANEL_W, self.panel_h)
+        self._panel_shell(panel_rect, accent=(255, 182, 72))
+
+        y = py + 14
+        y += self._text("CUSTOM HEURISTIC", self.font_med,
+                         ACCENT_2, px + PANEL_W // 2, y, 'center') + 4
+        self._badge("LIVE TUNING", px + PANEL_W // 2 - 54, y, SUCCESS, fill=(16, 28, 38))
+        y += 28
+        pygame.draw.line(self.screen, PANEL_EDGE,
+                         (px+10, y), (px+PANEL_W-10, y))
+        y += 10
+
+        card_w = (PANEL_W - 44) // 3
+        card_h = 68
+        stats = [("SCORE", game.score, ACCENT), ("LEVEL", game.level, ACCENT_2), ("LINES", game.lines, SUCCESS)]
+        for i, (label, val, color) in enumerate(stats):
+            r = pygame.Rect(px + 16 + i * (card_w + 6), y, card_w, card_h)
+            self._stat_card(r, label, val, color)
+
+        y += card_h + 14
+
+        info_card = pygame.Rect(px + 16, y, PANEL_W - 32, 96)
+        self._card(info_card, fill=(18, 24, 42), accent=(255, 182, 72))
+        self._text("CURRENT BOARD", self.font_xs, GRAY, info_card.x + 12, info_card.y + 10)
+        self._text(f"Max height: {game.board.max_height()}", self.font_xs, WHITE, info_card.x + 12, info_card.y + 34)
+        self._text(f"Holes: {game.board.count_holes()}", self.font_xs, WHITE, info_card.x + 12, info_card.y + 49)
+        self._text(f"Bumpiness: {game.board.bumpiness()}", self.font_xs, WHITE, info_card.x + 12, info_card.y + 64)
+
+        y += 108
+        pygame.draw.line(self.screen, PANEL_EDGE, (px+10, y), (px+PANEL_W-10, y))
+        y += 8
+
+        y += self._text("LIVE WEIGHTS", self.font_xs, GRAY, px+16, y) + 6
+        game._layout_weight_sliders()
+        for slider in game.weight_sliders:
+            slider.draw(self.screen, self.font_xs, self.font_tag)
+
+        if game.weight_sliders:
+            y = game.weight_sliders[-1].row_rect.bottom + 8
+
+        pygame.draw.line(self.screen, PANEL_EDGE, (px+10, y), (px+PANEL_W-10, y))
+        y += 8
+
+        info = game.ai_info
+        if info:
+            rot_names = ["0°", "90°", "180°", "270°"]
+            y += self._text("CURRENT BEST MOVE", self.font_xs, GRAY, px+16, y) + 4
+            y += self._text(f"Rotation : {rot_names[info.get('rotation',0)]}",
+                             self.font_xs, (160,220,255), px+16, y) + 2
+            y += self._text(f"Column   : {info.get('column', '?')}",
+                             self.font_xs, (160,220,255), px+16, y) + 2
+            y += self._text(f"Score    : {info.get('score', 0):.4f}",
+                             self.font_xs, (100,255,180), px+16, y) + 4
+
+        self._text("Drag sliders to update the AI live. Press R to reset.",
+                   self.font_xs, GRAY, px + PANEL_W // 2, self.panel_h - 22, 'center')
+
     def _draw_next_piece(self, piece, ox, oy):
         mini = 20
         for (dx, dy) in SHAPES[piece.name][0]:
@@ -958,8 +1172,9 @@ class MenuScreen:
         self.selected    = 0
         self.t           = 0.0
         self.options     = [
-            ("🎮  Play as Human",   "Classic keyboard-controlled Tetris",              False),
-            ("🤖  Watch AI Play",   "6-feature heuristic AI with lookahead",           True),
+            ("🎮  Play as Human",   "Classic keyboard-controlled Tetris",              "human"),
+            ("🤖  Watch AI Play",   "6-feature heuristic AI with lookahead",           "watch"),
+            ("🛠  Make Your Own Heuristic", "Live sliders for all 6 weights",       "custom"),
         ]
 
     def _badge(self, text, x, y, color, fill=None):
@@ -984,6 +1199,7 @@ class MenuScreen:
 
         mist = pygame.Surface((WINDOW_W, WINDOW_H), pygame.SRCALPHA)
         pygame.draw.circle(mist, (0, 200, 255, 28), (WINDOW_W - 120, 100), 190)
+
         pygame.draw.circle(mist, (255, 182, 72, 18), (120, WINDOW_H - 120), 220)
         pygame.draw.circle(mist, (255, 255, 255, 10), (WINDOW_W // 2, 160), 300)
         self.screen.blit(mist, (0, 0))
@@ -994,6 +1210,7 @@ class MenuScreen:
         shadow = pygame.Surface((card.width + 18, card.height + 18), pygame.SRCALPHA)
         pygame.draw.rect(shadow, (0, 0, 0, 92), shadow.get_rect(), border_radius=28)
         self.screen.blit(shadow, (card.x - 6, card.y + 10))
+
         pygame.draw.rect(self.screen, (14, 18, 34), card, border_radius=28)
         pygame.draw.rect(self.screen, ACCENT, card, 2, border_radius=28)
 
@@ -1075,7 +1292,7 @@ class MenuScreen:
             elif event.key in (pygame.K_DOWN, pygame.K_s):
                 self.selected = (self.selected + 1) % len(self.options)
             elif event.key in (pygame.K_RETURN, pygame.K_SPACE):
-                return self.options[self.selected][2]  # returns ai_mode bool
+                return self.options[self.selected][2]
         return None
 
 
@@ -1104,7 +1321,7 @@ def main():
             if state == "menu":
                 result = menu.handle_event(event)
                 if result is not None:
-                    game     = TetrisGame(ai_mode=result)
+                    game     = TetrisGame(mode=result)
                     renderer = Renderer(screen)
                     state    = "game"
             elif state == "game":
@@ -1137,4 +1354,3 @@ def main():
 if __name__ == "__main__":
     main() 
 
-    
