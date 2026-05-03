@@ -522,6 +522,8 @@ class TetrisGame:
         if abs(self.weights[key] - new_value) < 1e-6:
             return
         self.weights[key] = new_value
+        # Also update the AI solver's weights
+        self.ai.weights[key] = new_value
         self._sync_weight_sliders()
         if self.ai_mode and not self.game_over:
             self._plan_ai_move()
@@ -529,6 +531,9 @@ class TetrisGame:
     def reset_weights(self):
         for key, value in DEFAULT_WEIGHTS.items():
             self.weights[key] = value
+        # Also update the AI solver's weights
+        for key, value in DEFAULT_WEIGHTS.items():
+            self.ai.weights[key] = value
         self._sync_weight_sliders()
         if self.ai_mode and not self.game_over:
             self._plan_ai_move()
@@ -970,115 +975,69 @@ class Renderer:
         y += 8
 
         # ── Current board state ─────────────────────────────────────────────
-        y += self._text("LIVE HEURISTICS", self.font_xs, GRAY, px+16, y) + 6
+        y += self._text("LIVE HEURISTICS", self.font_xs, GRAY, px+16, y) + 8
 
         board = game.board
         heights  = board.column_heights()
+        lines    = game.lines
         agg_h    = sum(heights)
         holes    = board.count_holes()
         bump     = board.bumpiness()
         max_h    = board.max_height()
         wells    = board.well_depth()
 
-        stats = [
-            ("Agg. Height",  agg_h,  (255, 120, 120), 200),
-            ("Max Height",   max_h,  (255,  80,  80), 20),
-            ("Holes",        holes,  (255, 180,  80), 30),
-            ("Bumpiness",    bump,   (180, 120, 255), 80),
-            ("Well Depth",   wells,  (100, 200, 255), 30),
+        # All 6 heuristic metrics with colors and max values for scaling
+        heuristics = [
+            ("Lines Cleared", lines,   (100, 255, 100), 50),
+            ("Agg. Height",   agg_h,   (255, 120, 120), 200),
+            ("Max Height",    max_h,   (255,  80,  80), 20),
+            ("Holes",         holes,   (255, 180,  80), 30),
+            ("Bumpiness",     bump,    (180, 120, 255), 80),
+            ("Well Depth",    wells,   (100, 200, 255), 30),
         ]
-        for label, val, color, max_val in stats:
-            bar_w = max(0, min(PANEL_W - 100, int((val / max(max_val, 1)) * (PANEL_W - 100))))
-            y += self._text(f"{label}: {val}", self.font_xs, color, px+16, y) + 2
-            pygame.draw.rect(self.screen, DARK_GRAY, (px+16, y, PANEL_W-36, 10), border_radius=4)
-            pygame.draw.rect(self.screen, color, (px+16, y, bar_w, 10), border_radius=4)
-            y += 14
+        
+        for label, val, color, max_val in heuristics:
+            # Draw label and value side by side
+            label_text = f"{label}"
+            val_text = f"{val}"
+            label_surf = self.font_xs.render(label_text, True, GRAY)
+            val_surf = self.font_xs.render(val_text, True, color)
+            
+            self.screen.blit(label_surf, (px+16, y))
+            self.screen.blit(val_surf, (px + PANEL_W - 16 - val_surf.get_width(), y))
+            y += 18
+            
+            # Draw progress bar
+            bar_h = 6
+            bar_w_max = PANEL_W - 36
+            bar_w = max(0, min(bar_w_max, int((val / max(max_val, 1)) * bar_w_max)))
+            pygame.draw.rect(self.screen, DARK_GRAY, (px+16, y, bar_w_max, bar_h), border_radius=3)
+            pygame.draw.rect(self.screen, color, (px+16, y, bar_w, bar_h), border_radius=3)
+            y += 12
 
         y += 4
         pygame.draw.line(self.screen, PANEL_EDGE, (px+10, y), (px+PANEL_W-10, y))
-        y += 6
+        y += 8
 
         # ── Best move info ────────────────────────────────────────────────────
-        y += self._text("BEST MOVE SELECTED", self.font_xs, GRAY, px+16, y) + 4
+        y += self._text("BEST MOVE", self.font_xs, GRAY, px+16, y) + 6
 
         info = game.ai_info
         if info:
             rot_names = ["0°", "90°", "180°", "270°"]
 
-            y += self._text(f"Rotation : {rot_names[info.get('rotation',0)]}",
-                             self.font_xs, (160,220,255), px+16, y) + 2
-            y += self._text(f"Column   : {info.get('column', '?')}",
-                             self.font_xs, (160,220,255), px+16, y) + 2
-            y += self._text(f"Score    : {info.get('score', 0):.4f}",
-                             self.font_xs, (100,255,180), px+16, y) + 8
-
-            # Component breakdown
-            y += self._text("HEURISTIC BREAKDOWN", self.font_xs, GRAY, px+16, y) + 4
-
-            components = [
-                ("Lines Cleared",  info.get('lines',  0),     game.weights['complete_lines'],     (100,255,100)),
-                ("Aggregate Ht",   info.get('height', 0),     game.weights['aggregate_height'],   (255,120,120)),
-                ("Holes",          info.get('holes',  0),     game.weights['holes'],              (255,180, 80)),
-                ("Bumpiness",      info.get('bumpiness',0),   game.weights['bumpiness'],          (180,120,255)),
-                ("Max Height",     info.get('max_height', 0), game.weights['max_height'],         (255, 80, 80)),
-                ("Well Depth",     info.get('well_depth', 0), game.weights['well_depth'],         (100,200,255)),
-            ]
-
-            # Render breakdown in two columns to avoid horizontal overflow
-            for name, raw, weight, color in components:
-                contribution = weight * raw
-                left_x = px + 16
-                right_x = px + PANEL_W - 16
-                # Name on the left
-                y += self._text(f"{name}", self.font_xs, color, left_x, y)
-                # Compact stats on the right (raw | Δ)
-                stats_txt = f"raw={int(raw)}  Δ={contribution:+.3f}"
-                self._text(stats_txt, self.font_xs, color, right_x, y - self.font_xs.get_height(), 'right')
-                y += 3
-
-        y += 6
-        pygame.draw.line(self.screen, PANEL_EDGE, (px+10, y), (px+PANEL_W-10, y))
-        y += 6
-
-        # ── Weight legend ─────────────────────────────────────────────────────
-        y += self._text("HEURISTIC WEIGHTS", self.font_xs, GRAY, px+16, y) + 4
-        weight_info = [
-            ("complete_lines",    game.weights['complete_lines'],    (100,255,100)),
-            ("aggregate_height",  game.weights['aggregate_height'],  (255,120,120)),
-            ("holes",             game.weights['holes'],             (255,180, 80)),
-            ("bumpiness",         game.weights['bumpiness'],         (180,120,255)),
-            ("max_height",        game.weights['max_height'],        (255, 80, 80)),
-            ("well_depth",        game.weights['well_depth'],        (100,200,255)),
-        ]
-        for wname, wval, wcolor in weight_info:
-            bar_fill = int(abs(wval) * 120)
-            rect_x = px + 16
-            pygame.draw.rect(self.screen, DARK_GRAY, (rect_x, y+2, 120, 8), border_radius=3)
-            pygame.draw.rect(self.screen, wcolor, (rect_x, y+2, bar_fill, 8), border_radius=3)
-            y += self._text(f"{wname}: {wval:+.4f}", self.font_xs, wcolor, px+148, y) + 9
-
-        y += 4
-        pygame.draw.line(self.screen, PANEL_EDGE, (px+10, y), (px+PANEL_W-10, y))
-        y += 6
-
-        # ── Column heights mini-graph ─────────────────────────────────────────
-        remaining = self.panel_h - (y - py) - 16
-        if remaining > 40:
-            y += self._text("COLUMN HEIGHTS", self.font_xs, GRAY, px+16, y) + 4
-            bar_area_h = min(remaining - 20, 60)
-            bar_w_each = (PANEL_W - 36) // BOARD_W
-            max_h_val = max(heights) if max(heights) > 0 else 1
-            for i, h in enumerate(heights):
-                bh = int((h / max_h_val) * bar_area_h)
-                bx = px + 16 + i * bar_w_each
-                by = y + bar_area_h - bh
-                # Colour by height
-                ratio = h / BOARD_H
-                rc = (int(50 + 200*ratio), int(200 - 150*ratio), 100)
-                pygame.draw.rect(self.screen, rc, (bx, by, bar_w_each-2, bh), border_radius=2)
-            y += bar_area_h + 4
-            self._text(f"Max={max(heights)}  Avg={agg_h//BOARD_W}",
-                        self.font_xs, GRAY, px+16, y)
+            # Rotation and column on same row
+            rot_text = f"Rotation: {rot_names[info.get('rotation',0)]}"
+            col_text = f"Col: {info.get('column', '?')}"
+            rot_surf = self.font_xs.render(rot_text, True, (160,220,255))
+            col_surf = self.font_xs.render(col_text, True, (160,220,255))
+            
+            self.screen.blit(rot_surf, (px+16, y))
+            self.screen.blit(col_surf, (px + PANEL_W - 16 - col_surf.get_width(), y))
+            y += 18
+            
+            score_text = f"Score: {info.get('score', 0):.4f}"
+            y += self._text(score_text, self.font_xs, (100,255,180), px+16, y) + 4
 
         # Next piece
         self._draw_next_piece(game.next_piece, px + PANEL_W//2 - 32, py + 14)
